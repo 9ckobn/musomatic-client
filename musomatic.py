@@ -28,10 +28,18 @@ def _headers() -> dict:
 
 
 def api(method: str, path: str, **kwargs) -> dict:
-    with httpx.Client(base_url=API_URL, timeout=600, headers=_headers()) as c:
-        r = getattr(c, method)(path, **kwargs)
-        r.raise_for_status()
-        return r.json()
+    try:
+        with httpx.Client(base_url=API_URL, timeout=600, headers=_headers()) as c:
+            r = getattr(c, method)(path, **kwargs)
+            r.raise_for_status()
+            return r.json()
+    except httpx.ConnectError:
+        console.print(f"[red]❌ Сервер недоступен:[/] {API_URL}")
+        console.print("[dim]Проверь: контейнер запущен? URL правильный?[/]")
+        raise SystemExit(1)
+    except httpx.TimeoutException:
+        console.print(f"[red]❌ Таймаут подключения к[/] {API_URL}")
+        raise SystemExit(1)
 
 
 def api_poll(path: str, retries: int = 20) -> dict | None:
