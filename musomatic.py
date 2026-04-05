@@ -17,8 +17,30 @@ from rich.table import Table
 from rich.panel import Panel
 
 console = Console()
-API_URL = os.getenv("MUSIC_API_URL", "http://localhost:8844")
-API_KEY = os.getenv("MUSIC_API_KEY", "")
+
+CONFIG_DIR = Path.home() / ".config" / "musomatic"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+
+
+def _load_config() -> dict:
+    """Load config from ~/.config/musomatic/config.json"""
+    if CONFIG_FILE.exists():
+        try:
+            return json.loads(CONFIG_FILE.read_text())
+        except Exception:
+            pass
+    return {}
+
+
+def _save_config(cfg: dict):
+    """Save config to ~/.config/musomatic/config.json"""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
+
+
+_cfg = _load_config()
+API_URL = os.getenv("MUSIC_API_URL") or _cfg.get("server_url") or "http://localhost:8844"
+API_KEY = os.getenv("MUSIC_API_KEY") or _cfg.get("api_key") or ""
 
 
 def _headers() -> dict:
@@ -100,6 +122,72 @@ def status():
         ))
     except Exception as e:
         console.print(f"[red]✗ Server unreachable:[/] {e}")
+        if API_URL == "http://localhost:8844":
+            console.print("[dim]Запусти [bold]musomatic setup[/bold] для настройки адреса сервера[/]")
+
+
+@cli.command()
+@click.argument("key", required=False)
+@click.argument("value", required=False)
+def setup(key, value):
+    """Configure server connection.
+
+    \b
+    musomatic setup              — interactive setup
+    musomatic setup server_url   — show current server URL
+    musomatic setup server_url http://192.168.88.92:8844
+    """
+    global API_URL, API_KEY
+    cfg = _load_config()
+
+    if key and value:
+        cfg[key] = value
+        _save_config(cfg)
+        console.print(f"[green]✓[/] {key} = {value}")
+        if key == "server_url":
+            API_URL = value
+        return
+
+    if key:
+        console.print(f"{key} = {cfg.get(key, '[dim]not set[/]')}")
+        return
+
+    # Interactive setup
+    console.print("[bold]🎵 Musomatic Setup[/]\n")
+
+    current_url = cfg.get("server_url", "")
+    prompt_default = current_url or "http://192.168.88.92:8844"
+    url = console.input(f"  Server URL [{prompt_default}]: ").strip() or prompt_default
+
+    # Auto-add http:// if no protocol
+    if url and not url.startswith("http://") and not url.startswith("https://"):
+        url = f"http://{url}"
+        console.print(f"  [dim]→ Добавлен протокол: {url}[/]")
+
+    # Test connection (follow redirects)
+    console.print(f"  [dim]Проверяю {url}...[/]")
+    try:
+        with httpx.Client(base_url=url, timeout=10, follow_redirects=True) as c:
+            r = c.get("/health")
+            r.raise_for_status()
+            h = r.json()
+            console.print(f"  [green]✓[/] Подключено! {h.get('tracks_on_disk', '?')} треков на сервере")
+    except Exception as e:
+        console.print(f"  [red]✗[/] Не удалось подключиться: {e}")
+        console.print(f"  [dim]Подсказка: API порт по умолчанию — 8844 (не 4533)[/]")
+        if not click.confirm("  Сохранить всё равно?", default=False):
+            return
+
+    cfg["server_url"] = url
+    API_URL = url
+
+    api_key = console.input("  API Key (Enter = пропустить): ").strip()
+    if api_key:
+        cfg["api_key"] = api_key
+        API_KEY = api_key
+
+    _save_config(cfg)
+    console.print(f"\n[green]✓ Сохранено в {CONFIG_FILE}[/]")
 
 
 @cli.command()
