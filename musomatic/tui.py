@@ -79,17 +79,18 @@ class DownloadDialog(ModalScreen[str | None]):
 
 class MusomaticApp(App):
     CSS = """
-    #filter-bar {
-        dock: top; height: 3; padding: 0 1; display: none;
+    #search-bar {
+        dock: top; height: 3; padding: 0 1;
     }
-    #filter-bar.visible { display: block; }
+    #search-bar Input {
+        width: 100%;
+    }
     #status {
         dock: bottom; height: 1;
         background: $primary-background; padding: 0 1;
         color: $text-muted;
     }
     DataTable { height: 1fr; }
-    .downloading { color: $warning; }
     """
 
     TITLE = "🎵 musomatic"
@@ -97,8 +98,7 @@ class MusomaticApp(App):
     BINDINGS = [
         Binding("q", "quit", "Quit"),
         Binding("d", "delete_track", "Delete"),
-        Binding("slash", "toggle_filter", "Filter"),
-        Binding("escape", "clear_filter", "Clear", show=False),
+        Binding("slash", "focus_search", "Search"),
         Binding("r", "refresh", "Refresh"),
         Binding("n", "new_download", "Download"),
         Binding("space", "toggle_select", "Select", show=False),
@@ -115,8 +115,8 @@ class MusomaticApp(App):
 
     def compose(self) -> ComposeResult:
         yield Header()
-        with Vertical(id="filter-bar"):
-            yield Input(placeholder="Filter by artist, title, album...", id="filter-input")
+        with Vertical(id="search-bar"):
+            yield Input(placeholder="🔍 Search by artist, title, album...", id="search-input")
         yield DataTable(id="library")
         yield Static("Loading...", id="status")
         yield Footer()
@@ -238,32 +238,16 @@ class MusomaticApp(App):
     def _reload_after_change(self):
         self.load_library()
 
-    def action_toggle_filter(self):
-        bar = self.query_one("#filter-bar")
-        bar.toggle_class("visible")
-        if bar.has_class("visible"):
-            inp = self.query_one("#filter-input", Input)
-            inp.value = self.filter_text
-            inp.focus()
-        else:
-            self.query_one("#library", DataTable).focus()
+    def action_focus_search(self):
+        self.query_one("#search-input", Input).focus()
 
-    def action_clear_filter(self):
-        bar = self.query_one("#filter-bar")
-        if bar.has_class("visible"):
-            bar.remove_class("visible")
-            self.filter_text = ""
-            self.apply_filter()
-            self.query_one("#library", DataTable).focus()
-
-    @on(Input.Changed, "#filter-input")
-    def on_filter_changed(self, event: Input.Changed):
+    @on(Input.Changed, "#search-input")
+    def on_search_changed(self, event: Input.Changed):
         self.filter_text = event.value
         self.apply_filter()
 
-    @on(Input.Submitted, "#filter-input")
-    def on_filter_submitted(self, event: Input.Submitted):
-        self.query_one("#filter-bar").remove_class("visible")
+    @on(Input.Submitted, "#search-input")
+    def on_search_submitted(self, event: Input.Submitted):
         self.query_one("#library", DataTable).focus()
 
     def action_refresh(self):
