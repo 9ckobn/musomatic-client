@@ -1,6 +1,6 @@
 # 🎵 musomatic-client
 
-CLI client for [musomatic-server](https://github.com/9ckobn/musomatic-server) — search, download, and manage your lossless music library from the terminal.
+CLI & TUI client for [musomatic-server](https://github.com/9ckobn/musomatic-server) — search, download, and manage your lossless music library from the terminal.
 
 ## Install
 
@@ -15,56 +15,46 @@ pip install git+https://github.com/9ckobn/musomatic-client.git
 ## Setup
 
 ```bash
-# Interactive setup — server URL + API key
-musomatic setup
-
-# Or set directly
+musomatic setup                    # interactive setup
 musomatic setup server_url http://192.168.88.92:8844
 musomatic setup api_key YOUR_KEY
 ```
 
-Config is stored in `~/.config/musomatic/config.json` (chmod 600).
+Config: `~/.config/musomatic/config.json` (chmod 600).
 
-## Usage
+## Interactive TUI
 
 ```bash
-# Server status
-musomatic status
+musomatic tui
+```
 
-# Search
+Full-screen terminal interface for library management:
+- **Arrow keys** — navigate tracks (sorted by artist)
+- **`/`** — filter by artist, title, album
+- **`Space`** — select/deselect tracks
+- **`d`** — delete selected (with confirmation)
+- **`n`** — download new track
+- **`r`** — refresh library
+- **`q`** — quit
+
+## CLI Commands
+
+```bash
+musomatic status                   # server status
 musomatic search Rammstein - Du Hast
-
-# Download
 musomatic download Metallica - Enter Sandman
-
-# Batch from JSON file
-musomatic batch tracks.json
-musomatic batch tracks.json --scan-only
+musomatic batch tracks.json        # batch download from JSON
 musomatic batch tracks.json -l 10  # first 10 only
-
-# List library
-musomatic ls
-musomatic ls rammstein
-
-# Delete by ID or search
-musomatic rm 42 53
-musomatic rm nickelback -y
-
-# Audit library quality
-musomatic audit
-
-# 16→24bit upgrade scan
-musomatic upgrade
-
-# 🤖 AI recommendations
-musomatic recommend              # generate 30 recommendations
-musomatic recommend status       # check status
-musomatic recommend cleanup      # delete unrated, keep liked
-
-# List jobs
-musomatic jobs
-
-# Version
+musomatic ls                       # list all tracks (with quality)
+musomatic ls rammstein             # search tracks
+musomatic rm 42 53 60              # delete by IDs (batch)
+musomatic rm nickelback -y         # delete by search
+musomatic audit                    # audit library quality
+musomatic upgrade                  # 16→24bit upgrade scan
+musomatic recommend                # AI recommendations
+musomatic recommend status
+musomatic recommend cleanup
+musomatic jobs                     # list active jobs
 musomatic --version
 ```
 
@@ -77,18 +67,12 @@ musomatic --version
 ]
 ```
 
-Also supports: `{"songs": [{"artist": "...", "title": "..."}]}`
-
 ## Connecting from iPhone / Desktop Players
 
-musomatic server includes Navidrome (Subsonic API), so any Subsonic-compatible player works:
+musomatic server includes Navidrome (Subsonic API):
 
-- **iPhone**: [Amperfy](https://github.com/BLeeEZ/Amperfy) (free) or play:Sub ($5) — both support offline cache
+- **iPhone**: [Amperfy](https://github.com/BLeeEZ/Amperfy) — free, offline cache
 - **Desktop**: [Feishin](https://github.com/jeffvli/feishin) or Navidrome web UI
-
-## Server
-
-Requires [musomatic-server](https://github.com/9ckobn/musomatic-server) running on your home server.
 
 ## License
 
