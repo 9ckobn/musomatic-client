@@ -115,9 +115,9 @@ class SearchScreen(ModalScreen):
     def _run_search(self, query: str):
         try:
             data = _api(self.server_url, self.api_key, "get", "/search/browse", params={"q": query})
-            self.call_from_thread(self._show_results, data.get("results", []))
+            self.app.call_from_thread(self._show_results, data.get("results", []))
         except Exception as e:
-            self.call_from_thread(
+            self.app.call_from_thread(
                 lambda: self.query_one("#ss-bar", Static).update(f"❌ {e}"))
 
     def _show_results(self, results: list[dict]):
@@ -184,18 +184,18 @@ class SearchScreen(ModalScreen):
 
     @work(thread=True)
     def _do_quick_dl(self, query: str):
-        self.call_from_thread(self.notify, f"⬇️ {query}")
+        self.app.call_from_thread(self.notify, f"⬇️ {query}")
         try:
             result = _api(self.server_url, self.api_key, "post", "/quick",
                           json={"query": query})
             if result.get("status") == "done":
-                self.call_from_thread(self.notify,
+                self.app.call_from_thread(self.notify,
                     f"✅ {query} — {result.get('quality', 'OK')}")
             else:
-                self.call_from_thread(self.notify,
+                self.app.call_from_thread(self.notify,
                     f"❌ {result.get('message', 'Failed')}", severity="error")
         except Exception as e:
-            self.call_from_thread(self.notify, f"❌ {e}", severity="error")
+            self.app.call_from_thread(self.notify, f"❌ {e}", severity="error")
 
     @on(Button.Pressed, "#ss-close")
     def close_btn(self): self.dismiss()
@@ -248,10 +248,10 @@ class RecommendScreen(ModalScreen):
                        f"Provider: {data.get('provider', '?')}")
             else:
                 msg = "No previous recommendations — hit Generate!"
-            self.call_from_thread(
+            self.app.call_from_thread(
                 lambda: self.query_one("#rs-progress", Static).update(msg))
         except Exception as e:
-            self.call_from_thread(
+            self.app.call_from_thread(
                 lambda: self.query_one("#rs-progress", Static).update(f"❌ {e}"))
 
     @on(Button.Pressed, "#rs-gen")
@@ -261,7 +261,7 @@ class RecommendScreen(ModalScreen):
 
     @work(thread=True)
     def _do_generate(self):
-        self.call_from_thread(
+        self.app.call_from_thread(
             lambda: self.query_one("#rs-progress", Static).update("🤖 Starting..."))
         try:
             job = _api(self.server_url, self.api_key, "post",
@@ -297,11 +297,11 @@ class RecommendScreen(ModalScreen):
             self._enable_gen()
 
     def _set_prog(self, text: str):
-        self.call_from_thread(
+        self.app.call_from_thread(
             lambda: self.query_one("#rs-progress", Static).update(text))
 
     def _enable_gen(self):
-        self.call_from_thread(
+        self.app.call_from_thread(
             lambda: setattr(self.query_one("#rs-gen", Button), "disabled", False))
 
     @on(Button.Pressed, "#rs-clean")
@@ -316,10 +316,10 @@ class RecommendScreen(ModalScreen):
                 msg = "No recommendation playlist found"
             else:
                 msg = f"✅ Kept {data.get('kept', 0)} rated, deleted {data.get('deleted', 0)} unrated"
-            self.call_from_thread(
+            self.app.call_from_thread(
                 lambda: self.query_one("#rs-status", Static).update(msg))
         except Exception as e:
-            self.call_from_thread(
+            self.app.call_from_thread(
                 lambda: self.query_one("#rs-status", Static).update(f"❌ {e}"))
 
     @on(Button.Pressed, "#rs-close")
