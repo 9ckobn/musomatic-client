@@ -325,7 +325,7 @@ class DownloadsScreen(ModalScreen):
         self.app.call_from_thread(_update)
 
     @on(Button.Pressed, "#ds-ref")
-    def refresh(self): self._load_jobs_once()
+    def do_refresh(self): self._load_jobs_once()
 
     @work(thread=True)
     def _load_jobs_once(self): self._load_jobs()
