@@ -24,6 +24,14 @@ def _api(server_url: str, api_key: str, method: str, path: str, **kwargs) -> dic
         return r.json()
 
 
+def _trunc(text: str, maxlen: int = 22) -> str:
+    return text[:maxlen - 1] + "…" if len(text) > maxlen else text
+
+
+def _fmt_duration(secs: int) -> str:
+    return f"{secs // 60}:{secs % 60:02d}"
+
+
 # ── Confirm dialog ──
 
 class ConfirmDialog(ModalScreen[bool]):
@@ -64,11 +72,18 @@ class ConfirmDialog(ModalScreen[bool]):
 
 # ── Search & Download screen ──
 
+_STATUS_ICON = {
+    "queued": "⏳", "searching": "🔍", "downloading": "⬇️",
+    "done": "✅", "exists": "♻️", "failed": "❌", "not_found": "🚫",
+    "cancelled": "🚫",
+}
+
+
 class SearchScreen(ModalScreen):
     DEFAULT_CSS = """
     SearchScreen { align: center middle; }
     #ss {
-        width: 90%; height: 85%;
+        width: 92%; height: 88%;
         border: thick $accent; background: $surface; padding: 1 2;
     }
     #ss-input { margin-bottom: 1; }
@@ -86,6 +101,9 @@ class SearchScreen(ModalScreen):
         self.api_key = api_key
         self.results: list[dict] = []
         self.selected: set[int] = set()
+        self.dl_jobs: dict[int, str] = {}      # row_idx → job_id
+        self.dl_status: dict[int, str] = {}    # row_idx → status string
+        self._polling = False
 
     def compose(self) -> ComposeResult:
         with Vertical(id="ss"):
@@ -101,7 +119,7 @@ class SearchScreen(ModalScreen):
         t = self.query_one("#ss-table", DataTable)
         t.cursor_type = "row"
         t.zebra_stripes = True
-        t.add_columns("#", "✓", "Artist", "Title", "Album", "Quality", "Ver")
+        t.add_columns("St", "Artist", "Title", "Album", "Qual", "Dur")
         self.query_one("#ss-input", Input).focus()
 
     @on(Input.Submitted, "#ss-input")
@@ -123,20 +141,31 @@ class SearchScreen(ModalScreen):
     def _show_results(self, results: list[dict]):
         self.results = results
         self.selected = set()
-        t = self.query_one("#ss-table", DataTable)
-        t.clear()
-        for i, r in enumerate(results):
-            t.add_row(
-                str(i + 1), "",
-                r.get("artist", "?"), r.get("title", "?"),
-                r.get("album", ""), r.get("quality", "?"),
-                r.get("version", ""),
-            )
+        self.dl_jobs = {}
+        self.dl_status = {}
+        self._refresh_table()
         found = len(results)
         self.query_one("#ss-bar", Static).update(
             f"📊 {found} results · Space=select · Enter=download one")
         self.query_one("#ss-dl", Button).disabled = True
-        t.focus()
+        self.query_one("#ss-table", DataTable).focus()
+
+    def _refresh_table(self, keep_cursor: int | None = None):
+        t = self.query_one("#ss-table", DataTable)
+        t.clear()
+        for i, r in enumerate(self.results):
+            sel = "✓ " if i in self.selected else ""
+            st = self.dl_status.get(i, sel)
+            t.add_row(
+                st,
+                _trunc(r.get("artist", "?"), 20),
+                _trunc(r.get("title", "?"), 25),
+                _trunc(r.get("album", ""), 22),
+                r.get("quality", "?")[:6],
+                _fmt_duration(r.get("duration_s", 0)),
+            )
+        if keep_cursor is not None and keep_cursor < len(self.results):
+            t.move_cursor(row=keep_cursor)
 
     def on_key(self, event):
         if event.key == "space":
@@ -148,58 +177,162 @@ class SearchScreen(ModalScreen):
                 self.selected.discard(idx)
             else:
                 self.selected.add(idx)
-            # Update checkmarks
-            t.clear()
-            for i, r in enumerate(self.results):
-                sel = "✓" if i in self.selected else ""
-                t.add_row(
-                    str(i + 1), sel,
-                    r.get("artist", "?"), r.get("title", "?"),
-                    r.get("album", ""), r.get("quality", "?"),
-                    r.get("version", ""),
-                )
-            t.move_cursor(row=idx)
+            self._refresh_table(keep_cursor=idx)
             self.query_one("#ss-dl", Button).disabled = len(self.selected) == 0
-            self.query_one("#ss-bar", Static).update(f"✓ {len(self.selected)} selected")
+            n = len(self.selected)
+            self.query_one("#ss-bar", Static).update(f"✓ {n} selected")
 
     @on(DataTable.RowSelected, "#ss-table")
     def on_row_selected(self, event):
         idx = event.cursor_row
         if idx is not None and idx < len(self.results):
-            r = self.results[idx]
-            self._download_tracks([r])
+            self._start_downloads([idx])
 
     @on(Button.Pressed, "#ss-dl")
     def dl_selected(self):
-        tracks = [self.results[i] for i in sorted(self.selected)]
-        if tracks:
-            self._download_tracks(tracks)
+        if self.selected:
+            self._start_downloads(sorted(self.selected))
+            self.selected = set()
 
-    def _download_tracks(self, tracks: list[dict]):
-        for t in tracks:
-            q = f"{t['artist']} - {t['title']}"
-            self._do_quick_dl(q)
-        n = len(tracks)
-        self.query_one("#ss-bar", Static).update(f"⬇️ {n} download(s) started — check notifications")
+    def _start_downloads(self, indices: list[int]):
+        for idx in indices:
+            if idx in self.dl_jobs:
+                continue
+            r = self.results[idx]
+            self.dl_status[idx] = "🔍"
+            self._do_async_dl(idx, r.get("artist", ""), r.get("title", ""))
+        self._refresh_table()
+        if not self._polling:
+            self._polling = True
+            self._poll_jobs()
 
     @work(thread=True)
-    def _do_quick_dl(self, query: str):
-        self.app.call_from_thread(self.notify, f"⬇️ {query}")
+    def _do_async_dl(self, idx: int, artist: str, title: str):
         try:
-            result = _api(self.server_url, self.api_key, "post", "/quick",
-                          json={"query": query})
-            if result.get("status") == "done":
-                self.app.call_from_thread(self.notify,
-                    f"✅ {query} — {result.get('quality', 'OK')}")
-            else:
-                self.app.call_from_thread(self.notify,
-                    f"❌ {result.get('message', 'Failed')}", severity="error")
+            data = _api(self.server_url, self.api_key, "post", "/download",
+                        json={"artist": artist, "title": title})
+            job_id = data["job_id"]
+            self.dl_jobs[idx] = job_id
         except Exception as e:
-            self.app.call_from_thread(self.notify, f"❌ {e}", severity="error")
+            self.dl_status[idx] = "❌"
+            self.app.call_from_thread(self._refresh_table)
+
+    @work(thread=True)
+    def _poll_jobs(self):
+        while self._polling and self.dl_jobs:
+            time.sleep(2)
+            active = False
+            for idx, jid in list(self.dl_jobs.items()):
+                try:
+                    j = _api(self.server_url, self.api_key, "get", f"/jobs/{jid}")
+                    st = j.get("status", "?")
+                    icon = _STATUS_ICON.get(st, "❓")
+                    self.dl_status[idx] = icon
+                    if st not in ("done", "failed", "not_found", "exists", "cancelled"):
+                        active = True
+                except Exception:
+                    pass
+            self.app.call_from_thread(self._refresh_table)
+            if not active:
+                break
+        self._polling = False
+        done_count = sum(1 for s in self.dl_status.values() if s in ("✅", "♻️"))
+        fail_count = sum(1 for s in self.dl_status.values() if s in ("❌", "🚫"))
+        self.app.call_from_thread(
+            lambda: self.query_one("#ss-bar", Static).update(
+                f"✅ {done_count} downloaded · ❌ {fail_count} failed"))
 
     @on(Button.Pressed, "#ss-close")
     def close_btn(self): self.dismiss()
     def action_close(self): self.dismiss()
+
+
+# ── Downloads screen ──
+
+class DownloadsScreen(ModalScreen):
+    DEFAULT_CSS = """
+    DownloadsScreen { align: center middle; }
+    #ds {
+        width: 88%; height: 80%;
+        border: thick $primary; background: $surface; padding: 1 2;
+    }
+    #ds-table { height: 1fr; }
+    #ds-bar { height: 1; margin-top: 1; }
+    #ds-btns { height: 3; align-horizontal: center; margin-top: 1; }
+    #ds-btns Button { margin: 0 1; }
+    """
+
+    BINDINGS = [Binding("escape", "close", "Close")]
+
+    def __init__(self, server_url: str, api_key: str):
+        super().__init__()
+        self.server_url = server_url
+        self.api_key = api_key
+        self._live = True
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="ds"):
+            yield Label("📥 Downloads")
+            yield DataTable(id="ds-table")
+            yield Static("Loading...", id="ds-bar")
+            with Horizontal(id="ds-btns"):
+                yield Button("🔄 Refresh", variant="primary", id="ds-ref")
+                yield Button("Close", variant="default", id="ds-close")
+
+    def on_mount(self):
+        t = self.query_one("#ds-table", DataTable)
+        t.cursor_type = "row"
+        t.zebra_stripes = True
+        t.add_columns("Status", "Artist", "Title", "Elapsed")
+        self._auto_refresh()
+
+    @work(thread=True)
+    def _auto_refresh(self):
+        while self._live:
+            self._load_jobs()
+            time.sleep(3)
+
+    def _load_jobs(self):
+        try:
+            data = _api(self.server_url, self.api_key, "get", "/jobs")
+        except Exception as e:
+            self.app.call_from_thread(
+                lambda: self.query_one("#ds-bar", Static).update(f"❌ {e}"))
+            return
+
+        now = time.time()
+        rows = []
+        active = 0
+        for jid, info in sorted(data.items(), key=lambda x: x[1].get("started", 0), reverse=True):
+            st = info.get("status", "?")
+            icon = _STATUS_ICON.get(st, "❓")
+            artist = _trunc(info.get("artist", "?"), 22)
+            title = _trunc(info.get("title", "?"), 28)
+            started = info.get("started", 0)
+            elapsed = f"{int(now - started)}s" if started else "?"
+            rows.append((f"{icon} {st}", artist, title, elapsed))
+            if st in ("searching", "downloading", "queued"):
+                active += 1
+
+        def _update():
+            t = self.query_one("#ds-table", DataTable)
+            t.clear()
+            for row in rows[:50]:
+                t.add_row(*row)
+            self.query_one("#ds-bar", Static).update(
+                f"📊 {len(rows)} jobs · {active} active")
+
+        self.app.call_from_thread(_update)
+
+    @on(Button.Pressed, "#ds-ref")
+    def refresh(self): self._load_jobs_once()
+
+    @work(thread=True)
+    def _load_jobs_once(self): self._load_jobs()
+
+    @on(Button.Pressed, "#ds-close")
+    def close_btn(self): self._live = False; self.dismiss()
+    def action_close(self): self._live = False; self.dismiss()
 
 
 # ── Recommendations screen ──
@@ -352,6 +485,7 @@ class MusomaticApp(App):
         Binding("r", "refresh", "Refresh"),
         Binding("s", "server_search", "Search+DL"),
         Binding("g", "recommend", "AI Recs"),
+        Binding("j", "show_downloads", "Downloads"),
         Binding("space", "toggle_select", "Select", show=False),
     ]
 
@@ -521,6 +655,11 @@ class MusomaticApp(App):
             SearchScreen(self.server_url, self.api_key),
             lambda _=None: self._reload(),
         )
+
+    # ── Downloads ──
+
+    def action_show_downloads(self):
+        self.push_screen(DownloadsScreen(self.server_url, self.api_key))
 
     # ── AI Recommendations ──
 
