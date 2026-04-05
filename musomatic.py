@@ -16,6 +16,7 @@ from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
 
+__version__ = "1.0.0"
 console = Console()
 
 CONFIG_DIR = Path.home() / ".config" / "musomatic"
@@ -23,7 +24,6 @@ CONFIG_FILE = CONFIG_DIR / "config.json"
 
 
 def _load_config() -> dict:
-    """Load config from ~/.config/musomatic/config.json"""
     if CONFIG_FILE.exists():
         try:
             return json.loads(CONFIG_FILE.read_text())
@@ -33,9 +33,12 @@ def _load_config() -> dict:
 
 
 def _save_config(cfg: dict):
-    """Save config to ~/.config/musomatic/config.json"""
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
+    try:
+        os.chmod(CONFIG_FILE, 0o600)
+    except OSError:
+        pass
 
 
 _cfg = _load_config()
@@ -44,9 +47,16 @@ API_KEY = os.getenv("MUSIC_API_KEY") or _cfg.get("api_key") or ""
 
 
 def _headers() -> dict:
+    h = {}
     if API_KEY:
-        return {"x-api-key": API_KEY}
-    return {}
+        h["x-api-key"] = API_KEY
+    return h
+
+
+def _ensure_protocol(url: str) -> str:
+    if url and not url.startswith("http://") and not url.startswith("https://"):
+        return f"http://{url}"
+    return url
 
 
 def api(method: str, path: str, **kwargs) -> dict:
@@ -55,12 +65,22 @@ def api(method: str, path: str, **kwargs) -> dict:
             r = getattr(c, method)(path, **kwargs)
             r.raise_for_status()
             return r.json()
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 401:
+            console.print("[red]❌ Unauthorized — invalid or missing API key[/]")
+            console.print("[dim]Run: musomatic setup[/]")
+            raise SystemExit(1)
+        if e.response.status_code == 403:
+            console.print("[red]❌ Access denied[/]")
+            raise SystemExit(1)
+        raise
     except httpx.ConnectError:
-        console.print(f"[red]❌ Сервер недоступен:[/] {API_URL}")
-        console.print("[dim]Проверь: контейнер запущен? URL правильный?[/]")
+        console.print(f"[red]❌ Server unavailable:[/] {API_URL}")
+        console.print("[dim]Check: is the server running? Is the URL correct?[/]")
+        console.print("[dim]Run: musomatic setup[/]")
         raise SystemExit(1)
     except httpx.TimeoutException:
-        console.print(f"[red]❌ Таймаут подключения к[/] {API_URL}")
+        console.print(f"[red]❌ Connection timeout:[/] {API_URL}")
         raise SystemExit(1)
 
 
@@ -68,12 +88,14 @@ def api_poll(path: str, retries: int = 20) -> dict | None:
     for attempt in range(retries):
         try:
             return api("get", path)
+        except SystemExit:
+            return None
         except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.ReadError,
-                httpx.ConnectError, httpx.RemoteProtocolError) as e:
+                httpx.ConnectError, httpx.RemoteProtocolError):
             if attempt < retries - 1:
                 time.sleep(3)
             else:
-                console.print(f"[red]Server unreachable after {retries} retries: {e}[/]")
+                console.print(f"[red]Server unreachable after {retries} retries[/]")
                 return None
 
 
@@ -100,6 +122,7 @@ def quality_badge(result: dict) -> str:
 
 
 @click.group(invoke_without_command=True)
+@click.version_option(__version__, prog_name="musomatic")
 @click.pass_context
 def cli(ctx):
     """🎵 musomatic — lossless music search & download"""
@@ -115,15 +138,16 @@ def status():
         lib = api("get", "/library/stats")
         console.print(Panel(
             f"[green]●[/] Server: {API_URL}\n"
-            f"   Music dir: {h['music_dir']}\n"
             f"   Library: [bold]{lib['total_tracks']}[/] tracks, "
             f"{lib['total_size_gb']} GB, {lib['albums']} albums",
             title="🎵 Musomatic",
         ))
+    except SystemExit:
+        pass
     except Exception as e:
         console.print(f"[red]✗ Server unreachable:[/] {e}")
         if API_URL == "http://localhost:8844":
-            console.print("[dim]Запусти [bold]musomatic setup[/bold] для настройки адреса сервера[/]")
+            console.print("[dim]Run: [bold]musomatic setup[/bold][/]")
 
 
 @cli.command()
@@ -133,14 +157,16 @@ def setup(key, value):
     """Configure server connection.
 
     \b
-    musomatic setup              — interactive setup
-    musomatic setup server_url   — show current server URL
-    musomatic setup server_url http://192.168.88.92:8844
+    musomatic setup                    — interactive setup
+    musomatic setup server_url         — show current server URL
+    musomatic setup server_url https://api.example.com
     """
     global API_URL, API_KEY
     cfg = _load_config()
 
     if key and value:
+        if key == "server_url":
+            value = _ensure_protocol(value)
         cfg[key] = value
         _save_config(cfg)
         console.print(f"[green]✓[/] {key} = {value}")
@@ -149,7 +175,11 @@ def setup(key, value):
         return
 
     if key:
-        console.print(f"{key} = {cfg.get(key, '[dim]not set[/]')}")
+        val = cfg.get(key, "")
+        if key == "api_key" and val:
+            console.print(f"{key} = {val[:8]}...")
+        else:
+            console.print(f"{key} = {val or '[dim]not set[/]'}")
         return
 
     # Interactive setup
@@ -158,36 +188,32 @@ def setup(key, value):
     current_url = cfg.get("server_url", "")
     prompt_default = current_url or "http://192.168.88.92:8844"
     url = console.input(f"  Server URL [{prompt_default}]: ").strip() or prompt_default
+    url = _ensure_protocol(url)
 
-    # Auto-add http:// if no protocol
-    if url and not url.startswith("http://") and not url.startswith("https://"):
-        url = f"http://{url}"
-        console.print(f"  [dim]→ Добавлен протокол: {url}[/]")
-
-    # Test connection (follow redirects)
-    console.print(f"  [dim]Проверяю {url}...[/]")
+    console.print(f"  [dim]Checking {url}...[/]")
     try:
         with httpx.Client(base_url=url, timeout=10, follow_redirects=True) as c:
             r = c.get("/health")
             r.raise_for_status()
             h = r.json()
-            console.print(f"  [green]✓[/] Подключено! {h.get('tracks_on_disk', '?')} треков на сервере")
+            console.print(f"  [green]✓[/] Connected! {h.get('tracks', '?')} tracks on server")
     except Exception as e:
-        console.print(f"  [red]✗[/] Не удалось подключиться: {e}")
-        console.print(f"  [dim]Подсказка: API порт по умолчанию — 8844 (не 4533)[/]")
-        if not click.confirm("  Сохранить всё равно?", default=False):
+        console.print(f"  [red]✗[/] Cannot connect: {e}")
+        console.print(f"  [dim]Hint: API port is 8844 (not 4533, that's Navidrome)[/]")
+        if not click.confirm("  Save anyway?", default=False):
             return
 
     cfg["server_url"] = url
     API_URL = url
 
-    api_key = console.input("  API Key (Enter = пропустить): ").strip()
+    api_key = click.prompt("  API Key", default=cfg.get("api_key", ""), show_default=False,
+                           prompt_suffix=" (Enter to skip): ")
     if api_key:
         cfg["api_key"] = api_key
         API_KEY = api_key
 
     _save_config(cfg)
-    console.print(f"\n[green]✓ Сохранено в {CONFIG_FILE}[/]")
+    console.print(f"\n[green]✓ Saved to {CONFIG_FILE}[/]")
 
 
 @cli.command()
@@ -408,17 +434,16 @@ def upgrade():
 @click.argument("action", required=False, default="generate",
                 type=click.Choice(["generate", "status", "cleanup"]))
 @click.option("--provider", "-p", help="LLM provider (openai, deepseek, claude, openrouter)")
-@click.option("--api-key", "-k", help="LLM API key")
 @click.option("--model", "-m", help="Override model name")
-@click.option("--count", "-n", default=30, help="Number of recommendations")
-def recommend(action, provider, api_key, model, count):
+@click.option("--count", "-n", default=30, help="Number of recommendations (max 50)")
+def recommend(action, provider, model, count):
     """AI music recommendations. Generate, check status, or cleanup.
 
     \b
     musomatic recommend              # generate 30 AI recommendations
     musomatic recommend status       # check recommendation status
     musomatic recommend cleanup      # delete unrated, keep rated tracks
-    musomatic recommend -p deepseek -k sk-xxx -n 20  # custom provider
+    musomatic recommend -p openrouter -n 20  # custom provider
     """
     if action == "status":
         data = api("get", "/recommend/status")
@@ -447,11 +472,9 @@ def recommend(action, provider, api_key, model, count):
         return
 
     # Generate
-    body = {"count": count}
+    body = {"count": min(count, 50)}
     if provider:
         body["provider"] = provider
-    if api_key:
-        body["api_key"] = api_key
     if model:
         body["model"] = model
 
@@ -460,7 +483,7 @@ def recommend(action, provider, api_key, model, count):
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 400:
             console.print(f"[red]✗ {e.response.json().get('detail', str(e))}[/]")
-            console.print("[dim]Set LLM_PROVIDER + LLM_API_KEY in .env, or pass --provider and --api-key[/]")
+            console.print("[dim]Set LLM_PROVIDER + LLM_API_KEY in server .env[/]")
             return
         raise
 

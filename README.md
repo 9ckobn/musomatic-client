@@ -5,29 +5,25 @@ CLI client for [musomatic-server](https://github.com/9ckobn/musomatic-server) �
 ## Install
 
 ```bash
-git clone https://github.com/9ckobn/musomatic-client.git
-cd musomatic-client
-bash install.sh
+# Recommended (Arch Linux, any distro with pipx)
+pipx install git+https://github.com/9ckobn/musomatic-client.git
+
+# Or with pip (venv recommended)
+pip install git+https://github.com/9ckobn/musomatic-client.git
 ```
 
-Or manually:
-```bash
-pip install click httpx rich
-export MUSIC_API_URL=http://your-server:8844
-python musomatic.py status
-```
-
-## Configuration
+## Setup
 
 ```bash
-# Server URL (required)
-export MUSIC_API_URL=http://your-server:8844
+# Interactive setup — server URL + API key
+musomatic setup
 
-# API key for external access (optional)
-export MUSIC_API_KEY=your-key
-
-# Add to ~/.bashrc for persistence
+# Or set directly
+musomatic setup server_url http://192.168.88.92:8844
+musomatic setup api_key YOUR_KEY
 ```
+
+Config is stored in `~/.config/musomatic/config.json` (chmod 600).
 
 ## Usage
 
@@ -54,21 +50,22 @@ musomatic ls rammstein
 musomatic rm 42 53
 musomatic rm nickelback -y
 
-# Audit library
+# Audit library quality
 musomatic audit
 
 # 16→24bit upgrade scan
 musomatic upgrade
 
 # 🤖 AI recommendations
-musomatic recommend              # generate
+musomatic recommend              # generate 30 recommendations
 musomatic recommend status       # check status
 musomatic recommend cleanup      # delete unrated, keep liked
 
-musomatic recommend -p deepseek -k sk-xxx -n 20  # custom
-
 # List jobs
 musomatic jobs
+
+# Version
+musomatic --version
 ```
 
 ## Batch JSON Format
@@ -81,6 +78,13 @@ musomatic jobs
 ```
 
 Also supports: `{"songs": [{"artist": "...", "title": "..."}]}`
+
+## Connecting from iPhone / Desktop Players
+
+musomatic server includes Navidrome (Subsonic API), so any Subsonic-compatible player works:
+
+- **iPhone**: [Amperfy](https://github.com/BLeeEZ/Amperfy) (free) or play:Sub ($5) — both support offline cache
+- **Desktop**: [Feishin](https://github.com/jeffvli/feishin) or Navidrome web UI
 
 ## Server
 
