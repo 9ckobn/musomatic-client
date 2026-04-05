@@ -1,5 +1,6 @@
 """Interactive TUI for musomatic library management."""
 
+import time
 import httpx
 from textual.app import App, ComposeResult
 from textual.widgets import Header, Footer, DataTable, Input, Static, Label, Button
@@ -9,82 +10,329 @@ from textual.binding import Binding
 from textual import on, work
 
 
-class ConfirmDelete(ModalScreen[bool]):
+# ── Shared helpers ──
+
+def _make_client(server_url: str, api_key: str, timeout: float = 120) -> httpx.Client:
+    headers = {"x-api-key": api_key} if api_key else {}
+    return httpx.Client(base_url=server_url, timeout=timeout, headers=headers)
+
+
+def _api(server_url: str, api_key: str, method: str, path: str, **kwargs) -> dict:
+    with _make_client(server_url, api_key) as c:
+        r = getattr(c, method)(path, **kwargs)
+        r.raise_for_status()
+        return r.json()
+
+
+# ── Confirm dialog ──
+
+class ConfirmDialog(ModalScreen[bool]):
     DEFAULT_CSS = """
-    ConfirmDelete { align: center middle; }
-    #dialog {
+    ConfirmDialog { align: center middle; }
+    #confirm-box {
         width: 60; height: auto; max-height: 24;
         border: thick $error; background: $surface; padding: 1 2;
     }
-    #dialog Label { width: 100%; }
-    .track-item { color: $text-muted; }
-    #buttons { width: 100%; height: 3; align-horizontal: center; margin-top: 1; }
-    #buttons Button { margin: 0 2; }
+    .item { color: $text-muted; }
+    #confirm-btns { width: 100%; height: 3; align-horizontal: center; margin-top: 1; }
+    #confirm-btns Button { margin: 0 2; }
     """
 
-    def __init__(self, tracks: list[dict]):
+    def __init__(self, title: str, items: list[str]):
         super().__init__()
-        self.tracks = tracks
+        self._title = title
+        self._items = items
 
     def compose(self) -> ComposeResult:
-        with Vertical(id="dialog"):
-            yield Label(f"🗑  Delete {len(self.tracks)} track(s)?")
-            for t in self.tracks[:10]:
-                yield Label(f"  {t['artist']} — {t['title']}", classes="track-item")
-            if len(self.tracks) > 10:
-                yield Label(f"  ... and {len(self.tracks) - 10} more", classes="track-item")
-            with Horizontal(id="buttons"):
-                yield Button("Delete", variant="error", id="confirm")
-                yield Button("Cancel", variant="default", id="cancel")
+        with Vertical(id="confirm-box"):
+            yield Label(self._title)
+            for item in self._items[:10]:
+                yield Label(f"  {item}", classes="item")
+            if len(self._items) > 10:
+                yield Label(f"  ... +{len(self._items) - 10} more", classes="item")
+            with Horizontal(id="confirm-btns"):
+                yield Button("Delete", variant="error", id="yes")
+                yield Button("Cancel", variant="default", id="no")
 
-    @on(Button.Pressed, "#confirm")
-    def confirm(self): self.dismiss(True)
-
-    @on(Button.Pressed, "#cancel")
-    def cancel(self): self.dismiss(False)
-
+    @on(Button.Pressed, "#yes")
+    def yes(self): self.dismiss(True)
+    @on(Button.Pressed, "#no")
+    def no(self): self.dismiss(False)
     def on_key(self, event):
-        if event.key == "escape":
-            self.dismiss(False)
+        if event.key == "escape": self.dismiss(False)
 
 
-class DownloadDialog(ModalScreen[str | None]):
+# ── Search & Download screen ──
+
+class SearchScreen(ModalScreen):
     DEFAULT_CSS = """
-    DownloadDialog { align: center middle; }
-    #dl-dialog {
-        width: 70; height: auto;
-        border: thick $primary; background: $surface; padding: 1 2;
+    SearchScreen { align: center middle; }
+    #ss {
+        width: 90%; height: 85%;
+        border: thick $accent; background: $surface; padding: 1 2;
     }
-    #dl-dialog Label { margin-bottom: 1; }
+    #ss-input { margin-bottom: 1; }
+    #ss-table { height: 1fr; }
+    #ss-bar { height: 1; margin-top: 1; }
+    #ss-btns { height: 3; align-horizontal: center; margin-top: 1; }
+    #ss-btns Button { margin: 0 1; }
     """
 
+    BINDINGS = [Binding("escape", "close", "Close")]
+
+    def __init__(self, server_url: str, api_key: str):
+        super().__init__()
+        self.server_url = server_url
+        self.api_key = api_key
+        self.results: list[dict] = []
+        self.selected: set[int] = set()
+
     def compose(self) -> ComposeResult:
-        with Vertical(id="dl-dialog"):
-            yield Label("⬇️  Download New Track")
-            yield Label("[dim]Format: artist - title  (or just keywords)[/]")
-            yield Input(placeholder="e.g. Radiohead - Creep", id="dl-input")
+        with Vertical(id="ss"):
+            yield Label("🔍 Search Tidal & Download")
+            yield Input(placeholder="e.g.  depeche mode  or  Radiohead - Creep", id="ss-input")
+            yield DataTable(id="ss-table")
+            yield Static("[dim]Type query, press Enter to search[/]", id="ss-bar")
+            with Horizontal(id="ss-btns"):
+                yield Button("⬇ Download Selected", variant="success", id="ss-dl", disabled=True)
+                yield Button("Close", variant="default", id="ss-close")
 
     def on_mount(self):
-        self.query_one("#dl-input", Input).focus()
+        t = self.query_one("#ss-table", DataTable)
+        t.cursor_type = "row"
+        t.zebra_stripes = True
+        t.add_columns("#", "✓", "Artist", "Title", "Album", "Quality", "Ver")
+        self.query_one("#ss-input", Input).focus()
 
-    @on(Input.Submitted, "#dl-input")
-    def on_submit(self, event: Input.Submitted):
+    @on(Input.Submitted, "#ss-input")
+    def do_search(self, event: Input.Submitted):
         q = event.value.strip()
-        self.dismiss(q if q else None)
+        if q:
+            self.query_one("#ss-bar", Static).update("🔍 Searching Tidal...")
+            self._run_search(q)
+
+    @work(thread=True)
+    def _run_search(self, query: str):
+        try:
+            data = _api(self.server_url, self.api_key, "get", "/search/browse", params={"q": query})
+            self.call_from_thread(self._show_results, data.get("results", []))
+        except Exception as e:
+            self.call_from_thread(
+                lambda: self.query_one("#ss-bar", Static).update(f"❌ {e}"))
+
+    def _show_results(self, results: list[dict]):
+        self.results = results
+        self.selected = set()
+        t = self.query_one("#ss-table", DataTable)
+        t.clear()
+        for i, r in enumerate(results):
+            t.add_row(
+                str(i + 1), "",
+                r.get("artist", "?"), r.get("title", "?"),
+                r.get("album", ""), r.get("quality", "?"),
+                r.get("version", ""),
+            )
+        found = len(results)
+        self.query_one("#ss-bar", Static).update(
+            f"📊 {found} results · Space=select · Enter=download one")
+        self.query_one("#ss-dl", Button).disabled = True
+        t.focus()
 
     def on_key(self, event):
-        if event.key == "escape":
-            self.dismiss(None)
+        if event.key == "space":
+            t = self.query_one("#ss-table", DataTable)
+            idx = t.cursor_row
+            if idx is None or idx >= len(self.results):
+                return
+            if idx in self.selected:
+                self.selected.discard(idx)
+            else:
+                self.selected.add(idx)
+            # Update checkmarks
+            t.clear()
+            for i, r in enumerate(self.results):
+                sel = "✓" if i in self.selected else ""
+                t.add_row(
+                    str(i + 1), sel,
+                    r.get("artist", "?"), r.get("title", "?"),
+                    r.get("album", ""), r.get("quality", "?"),
+                    r.get("version", ""),
+                )
+            t.move_cursor(row=idx)
+            self.query_one("#ss-dl", Button).disabled = len(self.selected) == 0
+            self.query_one("#ss-bar", Static).update(f"✓ {len(self.selected)} selected")
 
+    @on(DataTable.RowSelected, "#ss-table")
+    def on_row_selected(self, event):
+        idx = event.cursor_row
+        if idx is not None and idx < len(self.results):
+            r = self.results[idx]
+            self._download_tracks([r])
+
+    @on(Button.Pressed, "#ss-dl")
+    def dl_selected(self):
+        tracks = [self.results[i] for i in sorted(self.selected)]
+        if tracks:
+            self._download_tracks(tracks)
+
+    def _download_tracks(self, tracks: list[dict]):
+        for t in tracks:
+            q = f"{t['artist']} - {t['title']}"
+            self._do_quick_dl(q)
+        n = len(tracks)
+        self.query_one("#ss-bar", Static).update(f"⬇️ {n} download(s) started — check notifications")
+
+    @work(thread=True)
+    def _do_quick_dl(self, query: str):
+        self.call_from_thread(self.notify, f"⬇️ {query}")
+        try:
+            result = _api(self.server_url, self.api_key, "post", "/quick",
+                          json={"query": query})
+            if result.get("status") == "done":
+                self.call_from_thread(self.notify,
+                    f"✅ {query} — {result.get('quality', 'OK')}")
+            else:
+                self.call_from_thread(self.notify,
+                    f"❌ {result.get('message', 'Failed')}", severity="error")
+        except Exception as e:
+            self.call_from_thread(self.notify, f"❌ {e}", severity="error")
+
+    @on(Button.Pressed, "#ss-close")
+    def close_btn(self): self.dismiss()
+    def action_close(self): self.dismiss()
+
+
+# ── Recommendations screen ──
+
+class RecommendScreen(ModalScreen):
+    DEFAULT_CSS = """
+    RecommendScreen { align: center middle; }
+    #rs {
+        width: 80%; height: 70%;
+        border: thick $success; background: $surface; padding: 1 2;
+    }
+    #rs-progress { height: 3; margin: 1 0; }
+    #rs-status { height: 1; }
+    #rs-btns { height: 3; align-horizontal: center; margin-top: 1; }
+    #rs-btns Button { margin: 0 1; }
+    """
+
+    BINDINGS = [Binding("escape", "close", "Close")]
+
+    def __init__(self, server_url: str, api_key: str):
+        super().__init__()
+        self.server_url = server_url
+        self.api_key = api_key
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="rs"):
+            yield Label("🤖 AI Music Recommendations")
+            yield Static("[dim]Generate personalized recommendations based on your library[/]",
+                         id="rs-progress")
+            yield Static("", id="rs-status")
+            with Horizontal(id="rs-btns"):
+                yield Button("🎲 Generate (30)", variant="success", id="rs-gen")
+                yield Button("🧹 Cleanup unrated", variant="warning", id="rs-clean")
+                yield Button("Close", variant="default", id="rs-close")
+
+    def on_mount(self):
+        self._load_last()
+
+    @work(thread=True)
+    def _load_last(self):
+        try:
+            data = _api(self.server_url, self.api_key, "get", "/recommend/status")
+            lr = data.get("last_result", {})
+            if lr:
+                msg = (f"Last run: ✅ {lr.get('downloaded', 0)}/{lr.get('recommended', 0)} downloaded\n"
+                       f"Provider: {data.get('provider', '?')}")
+            else:
+                msg = "No previous recommendations — hit Generate!"
+            self.call_from_thread(
+                lambda: self.query_one("#rs-progress", Static).update(msg))
+        except Exception as e:
+            self.call_from_thread(
+                lambda: self.query_one("#rs-progress", Static).update(f"❌ {e}"))
+
+    @on(Button.Pressed, "#rs-gen")
+    def generate(self):
+        self.query_one("#rs-gen", Button).disabled = True
+        self._do_generate()
+
+    @work(thread=True)
+    def _do_generate(self):
+        self.call_from_thread(
+            lambda: self.query_one("#rs-progress", Static).update("🤖 Starting..."))
+        try:
+            job = _api(self.server_url, self.api_key, "post",
+                       "/recommend/generate", json={"count": 30})
+            job_id = job["job_id"]
+
+            while True:
+                time.sleep(3)
+                j = _api(self.server_url, self.api_key, "get", f"/jobs/{job_id}")
+                s = j.get("status", "?")
+
+                if s == "generating":
+                    self._set_prog("🤖 AI is analyzing your library...")
+                elif s == "downloading":
+                    d = j.get("downloaded", 0)
+                    t = j.get("recommended", 0)
+                    nf = j.get("not_found", 0)
+                    self._set_prog(f"⬇️ Downloading {d}/{t}  ·  Not found: {nf}")
+                elif s == "done":
+                    d = j.get("downloaded", 0)
+                    t = j.get("recommended", 0)
+                    nf = j.get("not_found", 0)
+                    el = j.get("elapsed_s", "?")
+                    self._set_prog(f"✅ Done! {d}/{t} downloaded · {nf} not found · {el}s")
+                    self._enable_gen()
+                    break
+                elif s == "failed":
+                    self._set_prog(f"❌ {j.get('error', 'Unknown error')}")
+                    self._enable_gen()
+                    break
+        except Exception as e:
+            self._set_prog(f"❌ {e}")
+            self._enable_gen()
+
+    def _set_prog(self, text: str):
+        self.call_from_thread(
+            lambda: self.query_one("#rs-progress", Static).update(text))
+
+    def _enable_gen(self):
+        self.call_from_thread(
+            lambda: setattr(self.query_one("#rs-gen", Button), "disabled", False))
+
+    @on(Button.Pressed, "#rs-clean")
+    def cleanup(self):
+        self._do_cleanup()
+
+    @work(thread=True)
+    def _do_cleanup(self):
+        try:
+            data = _api(self.server_url, self.api_key, "post", "/recommend/cleanup")
+            if data.get("status") == "no_playlist":
+                msg = "No recommendation playlist found"
+            else:
+                msg = f"✅ Kept {data.get('kept', 0)} rated, deleted {data.get('deleted', 0)} unrated"
+            self.call_from_thread(
+                lambda: self.query_one("#rs-status", Static).update(msg))
+        except Exception as e:
+            self.call_from_thread(
+                lambda: self.query_one("#rs-status", Static).update(f"❌ {e}"))
+
+    @on(Button.Pressed, "#rs-close")
+    def close_btn(self): self.dismiss()
+    def action_close(self): self.dismiss()
+
+
+# ── Main App ──
 
 class MusomaticApp(App):
     CSS = """
-    #search-bar {
-        dock: top; height: 3; padding: 0 1;
-    }
-    #search-bar Input {
-        width: 100%;
-    }
+    #search-bar { dock: top; height: 3; padding: 0 1; }
+    #search-bar Input { width: 100%; }
     #status {
         dock: bottom; height: 1;
         background: $primary-background; padding: 0 1;
@@ -98,9 +346,12 @@ class MusomaticApp(App):
     BINDINGS = [
         Binding("q", "quit", "Quit"),
         Binding("d", "delete_track", "Delete"),
-        Binding("slash", "focus_search", "Search"),
+        Binding("slash", "focus_search", "/Search"),
+        Binding("escape", "focus_table", show=False),
+        Binding("tab", "switch_focus", show=False),
         Binding("r", "refresh", "Refresh"),
-        Binding("n", "new_download", "Download"),
+        Binding("s", "server_search", "Search+DL"),
+        Binding("g", "recommend", "AI Recs"),
         Binding("space", "toggle_select", "Select", show=False),
     ]
 
@@ -116,7 +367,7 @@ class MusomaticApp(App):
     def compose(self) -> ComposeResult:
         yield Header()
         with Vertical(id="search-bar"):
-            yield Input(placeholder="🔍 Search by artist, title, album...", id="search-input")
+            yield Input(placeholder="🔍 Filter library (instant)...", id="search-input")
         yield DataTable(id="library")
         yield Static("Loading...", id="status")
         yield Footer()
@@ -127,34 +378,33 @@ class MusomaticApp(App):
         table.zebra_stripes = True
         table.add_columns(" ", "ID", "Artist", "Title", "Album", "Quality", "MB")
         self.load_library()
-
-    def _api(self, method: str, path: str, **kwargs) -> dict:
-        headers = {"x-api-key": self.api_key} if self.api_key else {}
-        with httpx.Client(base_url=self.server_url, timeout=120, headers=headers) as c:
-            r = getattr(c, method)(path, **kwargs)
-            r.raise_for_status()
-            return r.json()
+        table.focus()
 
     @work(thread=True)
     def load_library(self):
         try:
-            data = self._api("get", "/library/tracks")
-            stats = self._api("get", "/library/stats")
+            data = _api(self.server_url, self.api_key, "get", "/library/tracks")
+            stats = _api(self.server_url, self.api_key, "get", "/library/stats")
         except Exception as e:
-            self.call_from_thread(self._set_status, f"❌ Error: {e}")
+            self.call_from_thread(self._set_status, f"❌ {e}")
             return
-        tracks = sorted(data["tracks"], key=lambda t: (t["artist"].lower(), t["title"].lower()))
-        self.call_from_thread(self._on_tracks_loaded, tracks, stats)
+        tracks = sorted(data["tracks"],
+                        key=lambda t: (t["artist"].lower(), t["title"].lower()))
+        self.call_from_thread(self._on_loaded, tracks, stats)
 
-    def _on_tracks_loaded(self, tracks: list[dict], stats: dict):
+    def _on_loaded(self, tracks: list[dict], stats: dict):
         self.all_tracks = tracks
-        self.sub_title = f"{stats['total_tracks']} tracks · {stats['total_size_gb']} GB · {stats['albums']} albums"
+        self.sub_title = (f"{stats['total_tracks']} tracks · "
+                          f"{stats['total_size_gb']} GB · {stats['albums']} albums")
         self.apply_filter()
 
     def apply_filter(self):
         if self.filter_text:
             q = self.filter_text.lower()
-            self.displayed = [t for t in self.all_tracks if q in f"{t['artist']} {t['title']} {t['album']}".lower()]
+            self.displayed = [
+                t for t in self.all_tracks
+                if q in f"{t['artist']} {t['title']} {t['album']}".lower()
+            ]
         else:
             self.displayed = list(self.all_tracks)
 
@@ -171,17 +421,16 @@ class MusomaticApp(App):
                 quality = f"16/{sr // 1000}k" if sr else "16bit"
             else:
                 quality = "?"
-            table.add_row(sel, str(tid), t["artist"], t["title"], t["album"], quality, str(t["size_mb"]))
-
+            table.add_row(sel, str(tid), t["artist"], t["title"],
+                          t["album"], quality, str(t["size_mb"]))
         self._update_status()
 
     def _update_status(self):
-        parts = [f"📊 {len(self.displayed)}/{len(self.all_tracks)} tracks"]
+        parts = [f"📊 {len(self.displayed)}/{len(self.all_tracks)}"]
         if self.filter_text:
             parts.append(f"🔍 \"{self.filter_text}\"")
         if self.selected_ids:
             parts.append(f"✓ {len(self.selected_ids)} selected")
-        parts.append("/ filter · d delete · space select · n download · r refresh · q quit")
         self._set_status("  │  ".join(parts))
 
     def _set_status(self, text: str):
@@ -196,17 +445,38 @@ class MusomaticApp(App):
             return self.displayed[idx]
         return None
 
-    # ── Actions ──
+    # ── Focus ──
+
+    def action_focus_search(self):
+        self.query_one("#search-input", Input).focus()
+
+    def action_focus_table(self):
+        self.query_one("#library", DataTable).focus()
+
+    def action_switch_focus(self):
+        inp = self.query_one("#search-input", Input)
+        if inp.has_focus:
+            self.query_one("#library", DataTable).focus()
+        else:
+            inp.focus()
+
+    @on(Input.Changed, "#search-input")
+    def on_search_changed(self, event: Input.Changed):
+        self.filter_text = event.value
+        self.apply_filter()
+
+    @on(Input.Submitted, "#search-input")
+    def on_search_submitted(self, event: Input.Submitted):
+        self.query_one("#library", DataTable).focus()
+
+    # ── Select / Delete ──
 
     def action_toggle_select(self):
         track = self._current_track()
         if not track:
             return
         tid = track["id"]
-        if tid in self.selected_ids:
-            self.selected_ids.discard(tid)
-        else:
-            self.selected_ids.add(tid)
+        self.selected_ids.symmetric_difference_update({tid})
         self.apply_filter()
 
     def action_delete_track(self):
@@ -218,61 +488,47 @@ class MusomaticApp(App):
                 return
             tracks = [track]
 
-        def on_confirm(confirmed: bool):
-            if confirmed:
-                self._do_delete(tracks)
-
-        self.push_screen(ConfirmDelete(tracks), on_confirm)
+        items = [f"{t['artist']} — {t['title']}" for t in tracks]
+        self.push_screen(
+            ConfirmDialog(f"🗑 Delete {len(tracks)} track(s)?", items),
+            lambda ok: self._do_delete(tracks) if ok else None,
+        )
 
     @work(thread=True)
     def _do_delete(self, tracks: list[dict]):
         ids = [t["id"] for t in tracks]
         try:
-            self._api("post", "/library/delete", json={"ids": ids})
+            _api(self.server_url, self.api_key, "post",
+                 "/library/delete", json={"ids": ids})
             self.selected_ids -= set(ids)
-            self.call_from_thread(self.notify, f"🗑  Deleted {len(ids)} track(s)", severity="warning")
-            self.call_from_thread(self._reload_after_change)
+            self.call_from_thread(self.notify,
+                f"🗑 Deleted {len(ids)} track(s)", severity="warning")
+            self.call_from_thread(self._reload)
         except Exception as e:
             self.call_from_thread(self.notify, f"Error: {e}", severity="error")
 
-    def _reload_after_change(self):
+    def _reload(self):
         self.load_library()
-
-    def action_focus_search(self):
-        self.query_one("#search-input", Input).focus()
-
-    @on(Input.Changed, "#search-input")
-    def on_search_changed(self, event: Input.Changed):
-        self.filter_text = event.value
-        self.apply_filter()
-
-    @on(Input.Submitted, "#search-input")
-    def on_search_submitted(self, event: Input.Submitted):
-        self.query_one("#library", DataTable).focus()
 
     def action_refresh(self):
         self.notify("Refreshing...")
         self.load_library()
 
-    def action_new_download(self):
-        def on_result(query: str | None):
-            if query:
-                self._do_download(query)
-        self.push_screen(DownloadDialog(), on_result)
+    # ── Search & Download (Tidal browse) ──
 
-    @work(thread=True)
-    def _do_download(self, query: str):
-        self.call_from_thread(self.notify, f"⬇️  Downloading: {query}...")
-        try:
-            result = self._api("post", "/quick", json={"query": query})
-            if result.get("status") == "done":
-                msg = result.get("quality", "Done")
-                self.call_from_thread(self.notify, f"✅ {query} — {msg}")
-                self.call_from_thread(self._reload_after_change)
-            else:
-                self.call_from_thread(self.notify, f"❌ {result.get('message', 'Failed')}", severity="error")
-        except Exception as e:
-            self.call_from_thread(self.notify, f"Error: {e}", severity="error")
+    def action_server_search(self):
+        self.push_screen(
+            SearchScreen(self.server_url, self.api_key),
+            lambda _=None: self._reload(),
+        )
+
+    # ── AI Recommendations ──
+
+    def action_recommend(self):
+        self.push_screen(
+            RecommendScreen(self.server_url, self.api_key),
+            lambda _=None: self._reload(),
+        )
 
 
 def run_tui():
