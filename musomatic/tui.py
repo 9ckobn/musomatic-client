@@ -8,6 +8,7 @@ from textual.containers import Vertical, Horizontal
 from textual.screen import ModalScreen
 from textual.binding import Binding
 from textual import on, work
+import threading
 
 
 # ── Shared helpers ──
@@ -127,9 +128,8 @@ class SearchScreen(ModalScreen):
         q = event.value.strip()
         if q:
             self.query_one("#ss-bar", Static).update("🔍 Searching Tidal...")
-            self._run_search(q)
+            threading.Thread(target=self._run_search, args=(q,), daemon=True).start()
 
-    @work(thread=True)
     def _run_search(self, query: str):
         try:
             data = _api(self.server_url, self.api_key, "get", "/search/browse", params={"q": query})
@@ -200,24 +200,24 @@ class SearchScreen(ModalScreen):
                 continue
             r = self.results[idx]
             self.dl_status[idx] = "🔍"
-            self._do_async_dl(idx, r.get("artist", ""), r.get("title", ""))
+            threading.Thread(target=self._do_async_dl,
+                             args=(idx, r.get("artist", ""), r.get("title", "")),
+                             daemon=True).start()
         self._refresh_table()
         if not self._polling:
             self._polling = True
-            self._poll_jobs()
+            threading.Thread(target=self._poll_jobs, daemon=True).start()
 
-    @work(thread=True)
     def _do_async_dl(self, idx: int, artist: str, title: str):
         try:
             data = _api(self.server_url, self.api_key, "post", "/download",
                         json={"artist": artist, "title": title})
             job_id = data["job_id"]
             self.dl_jobs[idx] = job_id
-        except Exception as e:
+        except Exception:
             self.dl_status[idx] = "❌"
             self.app.call_from_thread(self._refresh_table)
 
-    @work(thread=True)
     def _poll_jobs(self):
         while self._polling and self.dl_jobs:
             time.sleep(2)
@@ -284,9 +284,8 @@ class DownloadsScreen(ModalScreen):
         t.cursor_type = "row"
         t.zebra_stripes = True
         t.add_columns("Status", "Artist", "Title", "Elapsed")
-        self._auto_refresh()
+        threading.Thread(target=self._auto_refresh, daemon=True).start()
 
-    @work(thread=True)
     def _auto_refresh(self):
         while self._live:
             self._load_jobs()
@@ -325,10 +324,8 @@ class DownloadsScreen(ModalScreen):
         self.app.call_from_thread(_update)
 
     @on(Button.Pressed, "#ds-ref")
-    def do_refresh(self): self._load_jobs_once()
-
-    @work(thread=True)
-    def _load_jobs_once(self): self._load_jobs()
+    def do_refresh(self):
+        threading.Thread(target=self._load_jobs, daemon=True).start()
 
     @on(Button.Pressed, "#ds-close")
     def close_btn(self): self._live = False; self.dismiss()
@@ -369,9 +366,8 @@ class RecommendScreen(ModalScreen):
                 yield Button("Close", variant="default", id="rs-close")
 
     def on_mount(self):
-        self._load_last()
+        threading.Thread(target=self._load_last, daemon=True).start()
 
-    @work(thread=True)
     def _load_last(self):
         try:
             data = _api(self.server_url, self.api_key, "get", "/recommend/status")
@@ -390,9 +386,8 @@ class RecommendScreen(ModalScreen):
     @on(Button.Pressed, "#rs-gen")
     def generate(self):
         self.query_one("#rs-gen", Button).disabled = True
-        self._do_generate()
+        threading.Thread(target=self._do_generate, daemon=True).start()
 
-    @work(thread=True)
     def _do_generate(self):
         self.app.call_from_thread(
             lambda: self.query_one("#rs-progress", Static).update("🤖 Starting..."))
@@ -439,9 +434,8 @@ class RecommendScreen(ModalScreen):
 
     @on(Button.Pressed, "#rs-clean")
     def cleanup(self):
-        self._do_cleanup()
+        threading.Thread(target=self._do_cleanup, daemon=True).start()
 
-    @work(thread=True)
     def _do_cleanup(self):
         try:
             data = _api(self.server_url, self.api_key, "post", "/recommend/cleanup")
