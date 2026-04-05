@@ -283,7 +283,7 @@ class DownloadsScreen(ModalScreen):
         t = self.query_one("#ds-table", DataTable)
         t.cursor_type = "row"
         t.zebra_stripes = True
-        t.add_columns("Status", "Artist", "Title", "Elapsed")
+        t.add_columns("Status", "Artist", "Title", "Quality", "Time")
         threading.Thread(target=self._auto_refresh, daemon=True).start()
 
     def _auto_refresh(self):
@@ -309,7 +309,19 @@ class DownloadsScreen(ModalScreen):
             title = _trunc(info.get("title", "?"), 28)
             started = info.get("started", 0)
             elapsed = f"{int(now - started)}s" if started else "?"
-            rows.append((f"{icon} {st}", artist, title, elapsed))
+            # Show quality/source for done jobs, error for failed
+            detail = ""
+            if st == "done":
+                q = info.get("quality", "")
+                src = info.get("source", "")
+                detail = f"{q} [{src}]" if src else q
+            elif st in ("failed", "not_found"):
+                detail = info.get("error", "")[:30] if info.get("error") else ""
+            elif st == "downloading":
+                detail = "⬇️ in progress"
+            elif st == "searching":
+                detail = "🔍 finding sources"
+            rows.append((f"{icon} {st}", artist, title, _trunc(detail, 25), elapsed))
             if st in ("searching", "downloading", "queued"):
                 active += 1
 
